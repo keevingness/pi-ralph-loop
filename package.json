@@ -1,0 +1,17 @@
+{
+	"name": "pi-ralph-loop",
+	"version": "0.1.0",
+	"description": "Ralph loop extension for pi: YAML-configurable state machine that drives fresh-session rounds (coding, review, ...) until the task is done",
+	"keywords": ["pi-package"],
+	"type": "module",
+	"pi": {
+		"extensions": ["./extensions/ralph-loop.ts"]
+	},
+	"dependencies": {
+		"yaml": "2.8.0"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-agent-core": "*",
+		"@earendil-works/pi-coding-agent": "*"
+	}
+}
