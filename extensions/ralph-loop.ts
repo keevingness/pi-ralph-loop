@@ -10,7 +10,7 @@
  * agent never reads or writes it) and flips deterministically after each round.
  *
  * Per-state configuration (all in workflow.yaml):
- *   prompt                 - prompt file path, relative to .ralph/
+ *   prompt                 - prompt file path, relative to the workflow dir
  *   transition             - the single next state (enforced at validation)
  *   records_commit_range   - record HEAD before/after the round as from/to
  *   consumes_commit_range  - inject from/to into the directive, clear them after
@@ -31,18 +31,28 @@
  * (fresh context), sends the state's prompt plus an injected "本轮模式"
  * directive, waits for the agent to settle, then applies the transition.
  *
+ * Presets (预制工作流): a preset is a directory holding workflow.yaml plus its
+ * prompt files. Presets are layered - builtin (<package>/workflows/), global
+ * ($PI_CODING_AGENT_DIR/ralph/workflows/, default ~/.pi/agent/ralph/workflows/)
+ * and project (.ralph/workflows/). Same name at a later layer wins. Preset
+ * directories are read-only: runtime state (state.json/driver.json/config.json)
+ * always lives in .ralph/, and driver.json records which workflow dir is active.
+ *
  * Termination: done_marker in the agent reply, /ralph stop, maxRounds,
  * or the no-progress circuit breaker.
  *
  * Usage:
- *   /ralph init                create .ralph/ with default workflow, prompts, state, config
- *   /ralph start [maxRounds]   start the loop (default maxRounds: 20)
- *   /ralph stop                stop after the current round
- *   /ralph status              show current round / state
+ *   /ralph init                     create .ralph/ from the builtin default preset
+ *   /ralph start [preset] [rounds]  start the loop (no preset: .ralph/workflow.yaml)
+ *   /ralph presets                  list available presets and their origin
+ *   /ralph stop                     stop after the current round
+ *   /ralph status                   show current round / state
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { basename, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { parse as parseYaml } from "yaml";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
@@ -55,84 +65,9 @@ const DEFAULT_MAX_ROUNDS = 20;
 const WIDGET_KEY = "ralph-loop";
 
 const WORKFLOW_FILE = "workflow.yaml";
-
-export const DEFAULT_WORKFLOW_YAML = `# ralph loop 状态机配置（有向有环图，每状态仅一条出边）。
-#
-# 顶层字段：
-#   initial           起始状态
-#   no_progress_limit 连续 N 轮（任意状态累计）无新 commit 即熔断，默认 3
-#   done_marker       agent 回复中出现该标记则结束循环，默认 [RALPH:DONE]
-#
-# states.<name> 字段：
-#   prompt                 提示词文件路径（相对 .ralph/）
-#   transition             唯一出边：本轮结束后无条件流转到该状态
-#   records_commit_range   本轮结束时记录 HEAD 区间（from/to）供后续状态消费
-#   consumes_commit_range  指令中注入提交区间 from..to，本轮结束后清空
-#   expect_no_commit       本轮结束后 HEAD 有变化则告警违规
-#   directive              自定义指令模板，支持 {{state}}/{{from}}/{{to}} 占位符
-#   model                   本状态使用的模型，格式 provider/modelId（省略则用启动时钉定的模型）
-#   block.tools            本状态下拦截的工具名列表
-#   block.bash_patterns    本状态下拦截的 bash 命令正则列表
-
-initial: coding
-no_progress_limit: 3
-
-states:
-  coding:
-    prompt: prompts/coding.md
-    transition: review
-    records_commit_range: true
-  review:
-    prompt: prompts/review.md
-    transition: coding
-    consumes_commit_range: true
-    expect_no_commit: true
-    directive: |-
-      ---
-      ## 本轮模式（驱动程序注入）：review
-      执行 review 轮流程。
-      {% if from %}本轮审查 coding 轮产生的全部提交：区间 {{from}}..{{to}}，不得产生任何 commit。{% else %}本轮 coding 没有产生新提交。确认后回复"无新提交"即可，不要创建 issue，不得产生任何 commit。{% endif %}
-    block:
-      tools:
-        - edit
-        - write
-      bash_patterns:
-        - '(^|[;&|]\\s*|\\bgit\\s+)(commit\\b|reset\\b|revert\\b|merge\\b|rebase\\b|checkout\\s+--)'
-        - 'git add'
-`;
-
-const DEFAULT_CODING_PROMPT = `你是 ralph loop 的单轮执行者，当前处于 coding 状态。只执行 coding 轮流程，不要向用户提问，自主完成本轮。轮次状态由驱动程序管理，禁止读写 .ralph/ 目录下任何文件。
-
-cnb 仓库坐标在 .ralph/config.json 的 "repo" 字段（格式：组织/仓库）。
-
-## coding 轮流程
-1. 用 cnb CLI 查询待办：cnb issues list-issues --repo <repo> --labels ${TODO_LABEL} --state open --order-by created_at --page-size 100，取最早创建的一条。
-2. 若没有任何待办 issue：直接回复 ${DONE_MARKER} 和一段完成情况总结，不做任何其他事（驱动程序会结束循环）。
-3. 按 issue 需求编码，遵循仓库的 AGENTS.md / CLAUDE.md。只做 issue 描述范围内的事，不顺手改无关代码。
-4. 运行测试直到通过；如仓库要求 npm run check 则必须通过。
-5. commit：只 add 你改动的文件（禁止 git add -A / git add .），消息格式 fix|feat: ...（refs #<issue号>）。
-6. 用 cnb issues post-issue-comment 在该 issue 下评论改动摘要与 commit hash。不要关闭 issue，关闭由 review 轮负责。
-
-## 结束条件
-- coding 轮发现待办为空 → 回复 ${DONE_MARKER}。
-- 除此之外永远不要输出 ${DONE_MARKER}。`;
-
-const DEFAULT_REVIEW_PROMPT = `你是 ralph loop 的单轮执行者，当前处于 review 状态。只执行 review 轮流程，不要向用户提问，自主完成本轮。轮次状态由驱动程序管理，禁止读写 .ralph/ 目录下任何文件。
-
-cnb 仓库坐标在 .ralph/config.json 的 "repo" 字段（格式：组织/仓库）。
-
-## review 轮流程
-1. 审查范围由驱动程序注入的提交区间给出（from..to，覆盖 coding 轮产生的全部提交）：
-   - git log --oneline from..to 列出全部提交，逐个查看；git diff from..to 查看整体改动。
-   - 结合 code review skill 审查每一个提交。只审查区间内的提交。
-   - 若注入显示本轮没有新提交区间：确认后回复"无新提交"即可，不要创建 issue，结束本轮。
-2. 确定性问题（会导致构建或测试失败、逻辑错误、违反仓库明文规范）→ 每条用 cnb issues create-issue 创建 issue，加 label ${TODO_LABEL}，正文包含：文件与行号、问题描述、期望的修复方式。标题加 [review] 前缀。
-3. 建议性问题（风格偏好、可选优化）→ 不建 issue，直接忽略。
-4. 处理被审查的需求 issue（从区间内各 commit 消息中的 refs #N 收集全部 issue 编号）：
-   - 无确定性问题 → 逐个用 cnb issues update-issue --state closed --state-reason completed 关闭，并评论审查结论。
-   - 有确定性问题 → 同样全部关闭，但评论中注明剩余工作由新创建的 fix issue（#A、#B...）跟踪。
-   - 解析不到 issue 编号 → 不关闭，在回复中说明。
-5. review 轮绝对不能修改代码、不能产生任何 commit（驱动程序会强制拦截）。`;
+const WORKFLOWS_DIR = "workflows";
+const DEFAULT_PRESET = "coding-review";
+const PRESET_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 interface BlockConfig {
 	tools?: string[];
@@ -161,6 +96,8 @@ interface Workflow {
 	initial: string;
 	done_marker: string;
 	no_progress_limit: number;
+	/** Optional human-readable summary, shown by /ralph presets. */
+	description?: string;
 	states: Record<string, WorkflowStateConfig>;
 }
 
@@ -183,10 +120,74 @@ interface RalphDriver {
 	lastMessage?: string;
 	/** Model/thinking level pinned from the window where /ralph start ran. */
 	model?: { provider: string; modelId: string; thinkingLevel?: string };
+	/** Absolute dir holding the active workflow.yaml + prompts (a preset dir, or .ralph/). */
+	workflowDir?: string;
 }
 
 function ralphPath(cwd: string, name: string): string {
 	return join(cwd, RALPH_DIR, name);
+}
+
+/** Directory of the presets shipped inside this package (<package>/workflows/). */
+export function builtinWorkflowsDir(): string {
+	return fileURLToPath(new URL(`../${WORKFLOWS_DIR}/`, import.meta.url));
+}
+
+/**
+ * Preset lookup roots, lowest precedence first: builtin < global < project.
+ * The global root follows pi's PI_CODING_AGENT_DIR convention (default ~/.pi/agent).
+ */
+export function presetRoots(cwd: string): Array<{ dir: string; origin: string }> {
+	const globalDir = join(process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"), "ralph", WORKFLOWS_DIR);
+	return [
+		{ dir: builtinWorkflowsDir(), origin: "builtin" },
+		{ dir: globalDir, origin: "global" },
+		{ dir: join(cwd, RALPH_DIR, WORKFLOWS_DIR), origin: "project" },
+	];
+}
+
+/** Effective presets across all layers; a later layer overrides an earlier one with the same name. */
+export function findPresets(cwd: string): Array<{ name: string; dir: string; origin: string }> {
+	const found = new Map<string, { name: string; dir: string; origin: string }>();
+	for (const { dir: root, origin } of presetRoots(cwd)) {
+		let entries: string[];
+		try {
+			entries = readdirSync(root);
+		} catch {
+			continue;
+		}
+		for (const name of entries) {
+			if (!PRESET_NAME_RE.test(name)) continue;
+			const dir = join(root, name);
+			try {
+				if (!statSync(dir).isDirectory()) continue;
+			} catch {
+				continue;
+			}
+			if (!existsSync(join(dir, WORKFLOW_FILE))) continue;
+			found.set(name, { name, dir, origin });
+		}
+	}
+	return [...found.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** Resolve a preset by name (rejecting path traversal); project beats global beats builtin. */
+export function resolvePreset(cwd: string, name: string): { dir: string; origin: string } | { error: string } {
+	if (!PRESET_NAME_RE.test(name)) {
+		return { error: `预设名 "${name}" 非法（仅允许字母、数字及 . _ -，且不以符号开头）` };
+	}
+	const presets = findPresets(cwd);
+	const hit = presets.find((preset) => preset.name === name);
+	if (!hit) {
+		return { error: `预设 "${name}" 未找到。可用：${presets.map((preset) => preset.name).join(", ") || "(无)"}` };
+	}
+	return { dir: hit.dir, origin: hit.origin };
+}
+
+/** Dir holding the active workflow.yaml + prompts: the pinned preset dir, or .ralph/. */
+function activeWorkflowDir(cwd: string): string {
+	const driver = readJson<RalphDriver>(ralphPath(cwd, "driver.json"));
+	return driver?.workflowDir ?? join(cwd, RALPH_DIR);
 }
 
 function readJson<T>(path: string): T | undefined {
@@ -322,18 +323,24 @@ export function validateWorkflow(raw: unknown): WorkflowResult {
 		doneMarker = root.done_marker;
 	}
 
-	return { workflow: { initial, done_marker: doneMarker, no_progress_limit: noProgressLimit, states } };
+	let description: string | undefined;
+	if (root.description !== undefined) {
+		if (typeof root.description !== "string") return { error: "description 必须是字符串" };
+		description = root.description.trim() || undefined;
+	}
+
+	return { workflow: { initial, done_marker: doneMarker, no_progress_limit: noProgressLimit, description, states } };
 }
 
-/** Load and validate .ralph/workflow.yaml. */
-function loadWorkflow(cwd: string): WorkflowResult {
-	const path = ralphPath(cwd, WORKFLOW_FILE);
-	if (!existsSync(path)) return { error: `${RALPH_DIR}/${WORKFLOW_FILE} 不存在（先运行 /ralph init）` };
+/** Load and validate <dir>/workflow.yaml. The dir is either a preset dir or .ralph/. */
+function loadWorkflow(dir: string): WorkflowResult {
+	const path = join(dir, WORKFLOW_FILE);
+	if (!existsSync(path)) return { error: `${path} 不存在（先运行 /ralph init 或检查预设）` };
 	let raw: unknown;
 	try {
 		raw = parseYaml(readFileSync(path, "utf8"));
 	} catch (error) {
-		return { error: `${RALPH_DIR}/${WORKFLOW_FILE} 解析失败: ${error instanceof Error ? error.message : String(error)}` };
+		return { error: `${path} 解析失败: ${error instanceof Error ? error.message : String(error)}` };
 	}
 	return validateWorkflow(raw);
 }
@@ -365,25 +372,28 @@ export function buildDirective(workflow: Workflow, state: RalphState): string {
 	return `---\n\n${lines.join("\n")}`;
 }
 
-/** Create .ralph/ with default files if missing. Returns notify messages. */
-function initRalphFiles(cwd: string): Array<{ message: string; type: "info" | "warning" }> {
+/** Recursively copy src into dest, creating dirs and never overwriting existing files. */
+function copyMissing(src: string, dest: string): void {
+	mkdirSync(dest, { recursive: true });
+	for (const entry of readdirSync(src, { withFileTypes: true })) {
+		const from = join(src, entry.name);
+		const to = join(dest, entry.name);
+		if (entry.isDirectory()) copyMissing(from, to);
+		else if (!existsSync(to)) copyFileSync(from, to);
+	}
+}
+
+/** Materialize the builtin default preset into .ralph/ (plain mode), never overwriting. */
+function materializeDefaultWorkflow(cwd: string): void {
+	const src = join(builtinWorkflowsDir(), DEFAULT_PRESET);
+	if (existsSync(src)) copyMissing(src, join(cwd, RALPH_DIR));
+}
+
+/** Create the runtime files (.ralph/state.json, .ralph/config.json) if missing. */
+function ensureRuntimeFiles(cwd: string, initial: string): Array<{ message: string; type: "info" | "warning" }> {
 	mkdirSync(join(cwd, RALPH_DIR), { recursive: true });
 	const messages: Array<{ message: string; type: "info" | "warning" }> = [];
-	if (!existsSync(ralphPath(cwd, WORKFLOW_FILE))) {
-		writeFileSync(ralphPath(cwd, WORKFLOW_FILE), DEFAULT_WORKFLOW_YAML);
-	}
-	if (!existsSync(ralphPath(cwd, "prompts/coding.md"))) {
-		mkdirSync(join(cwd, RALPH_DIR, "prompts"), { recursive: true });
-		writeFileSync(ralphPath(cwd, "prompts/coding.md"), DEFAULT_CODING_PROMPT);
-	}
-	if (!existsSync(ralphPath(cwd, "prompts/review.md"))) {
-		mkdirSync(join(cwd, RALPH_DIR, "prompts"), { recursive: true });
-		writeFileSync(ralphPath(cwd, "prompts/review.md"), DEFAULT_REVIEW_PROMPT);
-	}
 	if (!existsSync(ralphPath(cwd, "state.json"))) {
-		// Start from the workflow's initial state when it already exists.
-		const loaded = loadWorkflow(cwd);
-		const initial = loaded.workflow?.initial ?? "coding";
 		writeJson(ralphPath(cwd, "state.json"), { state: initial, done: false } satisfies RalphState);
 	}
 	if (!existsSync(ralphPath(cwd, "config.json"))) {
@@ -396,6 +406,13 @@ function initRalphFiles(cwd: string): Array<{ message: string; type: "info" | "w
 		);
 	}
 	return messages;
+}
+
+/** /ralph init: scaffold .ralph/ from the builtin default preset, without overwriting. */
+function initRalphFiles(cwd: string): Array<{ message: string; type: "info" | "warning" }> {
+	const initial = loadWorkflow(join(builtinWorkflowsDir(), DEFAULT_PRESET)).workflow?.initial ?? "coding";
+	materializeDefaultWorkflow(cwd);
+	return ensureRuntimeFiles(cwd, initial);
 }
 
 export default function (pi: ExtensionAPI) {
@@ -412,7 +429,7 @@ export default function (pi: ExtensionAPI) {
 		let stateModel: { provider: string; modelId: string } | undefined;
 		const state = readJson<RalphState>(ralphPath(ctx.cwd, "state.json"));
 		if (state) {
-			const { workflow } = loadWorkflow(ctx.cwd);
+			const { workflow } = loadWorkflow(activeWorkflowDir(ctx.cwd));
 			stateModel = workflow?.states[state.state]?.model;
 		}
 		const target = stateModel ?? driver.model;
@@ -443,7 +460,7 @@ export default function (pi: ExtensionAPI) {
 		if (!driver?.running) return;
 		const state = readJson<RalphState>(ralphPath(cwd, "state.json"));
 		if (!state) return;
-		const { workflow } = loadWorkflow(cwd);
+		const { workflow } = loadWorkflow(activeWorkflowDir(cwd));
 		const config = workflow?.states[state.state];
 		if (!config?.block) return;
 
@@ -465,7 +482,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("ralph", {
-		description: "Ralph loop: init/start/stop/status - repeat state prompts in fresh sessions until done",
+		description: "Ralph loop: init/start [preset]/presets/stop/status - repeat state prompts in fresh sessions until done",
 		handler: async (args, ctx) => {
 			const cwd = ctx.cwd;
 			const sub = args.trim().split(/\s+/)[0] ?? "";
@@ -477,7 +494,8 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.notify("ralph: not initialized (run /ralph start)", "info");
 					return;
 				}
-				const workflow = loadWorkflow(cwd);
+				const workflowDir = activeWorkflowDir(cwd);
+				const workflow = loadWorkflow(workflowDir);
 				ctx.ui.notify(
 					[
 						`ralph: ${driver.running ? "RUNNING" : "stopped"} · round ${driver.round}/${driver.maxRounds}`,
@@ -486,6 +504,7 @@ export default function (pi: ExtensionAPI) {
 								.map(([n, c]) => (c.model ? `${n}(${c.model.provider}/${c.model.modelId})` : n))
 								.join(" -> ")} (initial: ${workflow.workflow.initial})`
 							: `workflow: invalid - ${workflow.error}`,
+						workflowDir === join(cwd, RALPH_DIR) ? "" : `preset: ${basename(workflowDir)}`,
 						`state: ${state ? JSON.stringify(state) : "(none)"}`,
 						driver.lastMessage ? `last: ${driver.lastMessage}` : "",
 					]
@@ -508,6 +527,20 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
+			if (sub === "presets") {
+				const presets = findPresets(cwd);
+				if (presets.length === 0) {
+					ctx.ui.notify("ralph: 没有找到任何预设", "warning");
+					return;
+				}
+				const lines = presets.map(({ name, dir, origin }) => {
+					const { workflow } = loadWorkflow(dir);
+					return `${name} [${origin}]${workflow?.description ? ` - ${workflow.description}` : ""}${workflow ? "" : " (invalid)"}`;
+				});
+				ctx.ui.notify(`ralph presets:\n${lines.join("\n")}\n\nrun: /ralph start <name> [maxRounds]`, "info");
+				return;
+			}
+
 			if (sub === "init") {
 				for (const { message, type } of initRalphFiles(cwd)) {
 					ctx.ui.notify(message, type);
@@ -517,12 +550,22 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (sub !== "start") {
-				ctx.ui.notify("Usage: /ralph init | /ralph start [maxRounds] | /ralph stop | /ralph status", "info");
+				ctx.ui.notify("Usage: /ralph init | /ralph start [preset] [maxRounds] | /ralph presets | /ralph stop | /ralph status", "info");
 				return;
 			}
 
-			// /ralph start
-			const maxRounds = Math.min(Math.max(Number.parseInt(args.trim().split(/\s+/)[1] ?? "", 10) || DEFAULT_MAX_ROUNDS, 1), 200);
+			// /ralph start [preset] [maxRounds]. A leading integer keeps the legacy
+			// plain form (/ralph start 30) reading .ralph/workflow.yaml.
+			const parts = args.trim().split(/\s+/).slice(1);
+			let presetName: string | undefined;
+			let roundsArg: string | undefined;
+			if (parts[0] && /^\d+$/.test(parts[0])) {
+				roundsArg = parts[0];
+			} else if (parts[0]) {
+				presetName = parts[0];
+				roundsArg = parts[1];
+			}
+			const maxRounds = Math.min(Math.max(Number.parseInt(roundsArg ?? "", 10) || DEFAULT_MAX_ROUNDS, 1), 200);
 
 			const existing = readJson<RalphDriver>(ralphPath(cwd, "driver.json"));
 			if (existing?.running) {
@@ -530,35 +573,55 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			for (const { message, type } of initRalphFiles(cwd)) {
-				ctx.ui.notify(message, type);
+			let workflowDir = join(cwd, RALPH_DIR);
+			if (presetName) {
+				const resolved = resolvePreset(cwd, presetName);
+				if ("error" in resolved) {
+					ctx.ui.notify(`ralph: ${resolved.error}`, "error");
+					return;
+				}
+				workflowDir = resolved.dir;
+			} else {
+				materializeDefaultWorkflow(cwd);
 			}
 
-			const workflowResult = loadWorkflow(cwd);
+			const workflowResult = loadWorkflow(workflowDir);
 			if (!workflowResult.workflow) {
 				ctx.ui.notify(`ralph: ${workflowResult.error}`, "error");
 				return;
 			}
 			const workflow = workflowResult.workflow;
 
-			// Load and validate every state's prompt file up front.
+			// Validate every state's prompt file (and model) up front, before any
+			// runtime side effect, so a failed start never mutates state.
 			const prompts: Record<string, string> = {};
 			for (const [name, config] of Object.entries(workflow.states)) {
 				if (config.model && !ctx.modelRegistry.find(config.model.provider, config.model.modelId)) {
 					ctx.ui.notify(`ralph: states.${name}.model 未找到: ${config.model.provider}/${config.model.modelId}`, "error");
 					return;
 				}
-				const promptPath = ralphPath(cwd, config.prompt);
+				const promptPath = join(workflowDir, config.prompt);
 				if (!existsSync(promptPath)) {
-					ctx.ui.notify(`ralph: states.${name}.prompt 文件不存在: ${RALPH_DIR}/${config.prompt}`, "error");
+					ctx.ui.notify(`ralph: states.${name}.prompt 文件不存在: ${promptPath}`, "error");
 					return;
 				}
 				const prompt = readFileSync(promptPath, "utf8");
 				if (!prompt.trim()) {
-					ctx.ui.notify(`ralph: states.${name}.prompt 文件为空: ${RALPH_DIR}/${config.prompt}`, "error");
+					ctx.ui.notify(`ralph: states.${name}.prompt 文件为空: ${promptPath}`, "error");
 					return;
 				}
 				prompts[name] = prompt;
+			}
+
+			for (const { message, type } of ensureRuntimeFiles(cwd, workflow.initial)) {
+				ctx.ui.notify(message, type);
+			}
+
+			// A state left over from a different workflow cannot be advanced; reset it.
+			const persisted = readJson<RalphState>(ralphPath(cwd, "state.json"));
+			if (persisted && !workflow.states[persisted.state]) {
+				writeJson(ralphPath(cwd, "state.json"), { state: workflow.initial, done: false } satisfies RalphState);
+				ctx.ui.notify(`ralph: state "${persisted.state}" 不属于该 workflow，重置为 "${workflow.initial}"`, "warning");
 			}
 
 			writeJson(ralphPath(cwd, "driver.json"), {
@@ -569,9 +632,13 @@ export default function (pi: ExtensionAPI) {
 				model: ctx.model
 					? { provider: ctx.model.provider, modelId: ctx.model.id, thinkingLevel: ctx.thinkingLevel }
 					: undefined,
+				workflowDir,
 			} satisfies RalphDriver);
 
-			ctx.ui.notify(`ralph: starting loop (max ${maxRounds} rounds, workflow: ${Object.keys(workflow.states).join(" -> ")})`, "info");
+			ctx.ui.notify(
+				`ralph: starting loop (max ${maxRounds} rounds, ${presetName ? `preset: ${presetName}, ` : ""}workflow: ${Object.keys(workflow.states).join(" -> ")})`,
+				"info",
+			);
 			if (ctx.model) {
 				ctx.ui.notify(`ralph: pinned model ${ctx.model.provider}/${ctx.model.id}`, "info");
 			}

@@ -2,7 +2,7 @@
 
 pi 扩展：ralph loop。在全新 session 中按状态机逐轮执行提示词，直到任务完成。
 
-状态机由 `.ralph/workflow.yaml` 配置为**有向有环图**（每状态仅一条出边），由插件独占并在每轮结束后无条件流转；agent 无法读写或绕过状态。
+状态机由 workflow 配置（`.ralph/workflow.yaml` 或预设目录内的 `workflow.yaml`）定义为**有向有环图**（每状态仅一条出边），由插件独占并在每轮结束后无条件流转；agent 无法读写或绕过状态。
 
 ## 安装
 
@@ -15,20 +15,54 @@ pi -e ./pi-ralph-loop                            # 临时加载，仅本次运�
 安装后在项目根目录运行 pi，使用 `/ralph` 命令：
 
 ```bash
-/ralph init                # 生成 .ralph/（workflow.yaml、prompts/、state.json、config.json），不覆盖已有文件
-/ralph start [maxRounds]   # 启动循环（默认 maxRounds 20，捕获启动窗口的模型）
-/ralph stop                # 当前轮结束后停止
-/ralph status              # 查看轮次 / 状态
+/ralph init                        # 从内置默认预设生成 .ralph/（workflow.yaml、prompts/、state.json、config.json），不覆盖已有文件
+/ralph presets                     # 列出可用预设及其来源（builtin / global / project）
+/ralph start [preset] [maxRounds]  # 启动循环（默认 maxRounds 20，捕获启动窗口的模型）
+/ralph stop                        # 当前轮结束后停止
+/ralph status                      # 查看轮次 / 状态
 ```
+
+`/ralph start` 不带 preset 时读 `.ralph/workflow.yaml`（旧行为）；首参为纯数字时视为 maxRounds，如 `/ralph start 30`。
+
+## 预制工作流（presets）
+
+预设 = 一个目录，内含 `workflow.yaml` 与本工作流的提示词文件：
+
+```
+workflows/coding-review/
+  workflow.yaml
+  prompts/coding.md
+  prompts/review.md
+```
+
+按以下顺序分层查找（同名后层覆盖前层）：
+
+| 层 | 位置 |
+| --- | --- |
+| builtin | 扩展包内的 `workflows/` |
+| global | `$PI_CODING_AGENT_DIR/ralph/workflows/`（默认 `~/.pi/agent/ralph/workflows/`） |
+| project | `<项目>/.ralph/workflows/` |
+
+```bash
+/ralph presets            # 列出 name [来源] - description
+/ralph start coding-review
+```
+
+预设目录是**只读**的：运行时状态（`state.json`/`driver.json`/`config.json`）始终写在 `.ralph/`，因此预设可跨项目共享、不会被改写。`workflow.yaml` 可选顶层字段 `description`（字符串），供 `/ralph presets` 展示。
+
+自建预设：在 `~/.pi/agent/ralph/workflows/<name>/` 或 `<项目>/.ralph/workflows/<name>/` 下放 `workflow.yaml` 与提示词即可，无需在 `.ralph/` 里再写一份。预设名只允许字母/数字/`._-`（拒绝路径穿越）；启动前的校验（工作流、prompt 文件、模型）全部失败即返回，不产生任何副作用。
 
 ## 运行时文件（`.ralph/`，项目本地，不入库）
 
-- `workflow.yaml` - 状态机配置（见下）
-- `prompts/<state>.md` - 每状态提示词
+- `workflow.yaml` - 仅 plain 模式（`/ralph start` 不带 preset）使用；预设模式下由 `driver.json` 的 `workflowDir` 指向预设目录
+- `prompts/<state>.md` - 每状态提示词（相对当前 workflow 目录）
 - `state.json` - 当前状态与提交区间（仅插件写入；agent 被禁止读写 `.ralph/`）
 - `config.json` - 仓库坐标等（如 cnb 的 `org/repo`）
+- `driver.json` - 运行态：轮次、钉定模型、`workflowDir`
 
 ## workflow.yaml
+
+单个预设（或 plain 模式的 `.ralph/workflow.yaml`）的格式：
 
 ```yaml
 initial: coding
@@ -36,7 +70,7 @@ no_progress_limit: 3            # 全局熔断：连续 N 轮（任意状态累�
 
 states:
   coding:
-    prompt: prompts/coding.md   # 提示词文件，路径相对 .ralph/
+    prompt: prompts/coding.md   # 提示词文件，路径相对当前 workflow 目录
     transition: review          # 唯一出边：本轮结束后无条件流转
     records_commit_range: true  # 轮结束时记录 HEAD 区间（from/to）
     model: newapi/glm-5.3       # 可选：本状态使用的模型（省略则用启动时钉定的模型）
@@ -65,12 +99,13 @@ states:
 | `initial` | 起始状态 |
 | `no_progress_limit` | 全局熔断阈值，默认 3；有 commit 即清零 |
 | `done_marker` | agent 回复中出现该标记则结束循环，默认 `[RALPH:DONE]` |
+| `description` | 可选，供 `/ralph presets` 展示 |
 
 状态：
 
 | 字段 | 说明 |
 | --- | --- |
-| `prompt` | 提示词文件路径（相对 `.ralph/`），必填 |
+| `prompt` | 提示词文件路径（相对当前 workflow 目录），必填 |
 | `transition` | 唯一出边，必填 |
 | `records_commit_range` | 轮结束时记录 HEAD before/after 为 from/to |
 | `consumes_commit_range` | 指令注入区间；轮结束后清空 |
@@ -96,10 +131,20 @@ states:
 - `expect_no_commit` 状态轮后检查 HEAD，变化即告警
 - 每轮使用全新 session（`ctx.newSession()`），上下文不串
 
+## 项目结构
+
+```
+extensions/                     # /ralph 命令与状态机驱动
+workflows/coding-review/        # 内置预设
+                    # 另：全局 ~/.pi/agent/ralph/workflows/、项目 .ralph/workflows/
+test/
+```
+
 ## 开发
 
 ```bash
 npm install --ignore-scripts
-node --experimental-strip-types test/offline-test.mts   # 校验/指令生成/模型解析
+node --experimental-strip-types test/offline-test.mts   # 校验/指令生成/模型解析/预设解析
 node --experimental-strip-types test/regex-test.mts     # 默认拦截正则行为
+node --experimental-strip-types test/preset-test.mts    # 预设工作流集成测试（真实文件系统 + handler）
 ```

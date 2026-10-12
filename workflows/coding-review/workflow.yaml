@@ -1,0 +1,45 @@
+# ralph loop 状态机配置（有向有环图，每状态仅一条出边）。
+#
+# 顶层字段：
+#   initial           起始状态
+#   description       可选，供 /ralph presets 展示
+#   no_progress_limit 连续 N 轮（任意状态累计）无新 commit 即熔断，默认 3
+#   done_marker       agent 回复中出现该标记则结束循环，默认 [RALPH:DONE]
+#
+# states.<name> 字段：
+#   prompt                 提示词文件路径（相对当前 workflow 目录）
+#   transition             唯一出边：本轮结束后无条件流转到该状态
+#   records_commit_range   本轮结束时记录 HEAD 区间（from/to）供后续状态消费
+#   consumes_commit_range  指令中注入提交区间 from..to，本轮结束后清空
+#   expect_no_commit       本轮结束后 HEAD 有变化则告警违规
+#   directive              自定义指令模板，支持 {{state}}/{{from}}/{{to}} 占位符
+#   model                   本状态使用的模型，格式 provider/modelId（省略则用启动时钉定的模型）
+#   block.tools            本状态下拦截的工具名列表
+#   block.bash_patterns    本状态下拦截的 bash 命令正则列表
+
+initial: coding
+description: cnb issue 驱动：（coding 实现 → review 审查）交替循环，直到无待办
+no_progress_limit: 3
+
+states:
+  coding:
+    prompt: prompts/coding.md
+    transition: review
+    records_commit_range: true
+  review:
+    prompt: prompts/review.md
+    transition: coding
+    consumes_commit_range: true
+    expect_no_commit: true
+    directive: |-
+      ---
+      ## 本轮模式（驱动程序注入）：review
+      执行 review 轮流程。
+      {% if from %}本轮审查 coding 轮产生的全部提交：区间 {{from}}..{{to}}，不得产生任何 commit。{% else %}本轮 coding 没有产生新提交。确认后回复"无新提交"即可，不要创建 issue，不得产生任何 commit。{% endif %}
+    block:
+      tools:
+        - edit
+        - write
+      bash_patterns:
+        - '(^|[;&|]\s*|\bgit\s+)(commit\b|reset\b|revert\b|merge\b|rebase\b|checkout\s+--)'
+        - 'git add'

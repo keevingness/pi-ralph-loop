@@ -1,8 +1,10 @@
-import { validateWorkflow, DEFAULT_WORKFLOW_YAML } from "../extensions/ralph-loop.ts";
+import { readFileSync } from "node:fs";
+import { validateWorkflow } from "../extensions/ralph-loop.ts";
 import { parse as parseYaml } from "yaml";
 import assert from "node:assert/strict";
 
-const wf = validateWorkflow(parseYaml(DEFAULT_WORKFLOW_YAML)).workflow!;
+const yaml = readFileSync(new URL("../workflows/coding-review/workflow.yaml", import.meta.url), "utf8");
+const wf = validateWorkflow(parseYaml(yaml)).workflow!;
 const patterns = wf.states.review.block!.bash_patterns!;
 const cases: Array<[string, boolean]> = [
 	["git commit -m x", true],

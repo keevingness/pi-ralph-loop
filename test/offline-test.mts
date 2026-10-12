@@ -8,7 +8,10 @@ import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
-import { validateWorkflow, buildDirective, DEFAULT_WORKFLOW_YAML } from "../extensions/ralph-loop.ts";
+import { validateWorkflow, buildDirective, findPresets, resolvePreset, builtinWorkflowsDir } from "../extensions/ralph-loop.ts";
+
+// Isolate preset lookup from the developer's real global dir (PI_CODING_AGENT_DIR).
+process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "ralph-agent-"));
 
 let passed = 0;
 function ok(name: string, fn: () => void) {
@@ -20,7 +23,7 @@ function ok(name: string, fn: () => void) {
 // --- validateWorkflow ---
 
 function defaultWorkflowYaml(): string {
-	return DEFAULT_WORKFLOW_YAML;
+	return readFileSync(new URL("../workflows/coding-review/workflow.yaml", import.meta.url), "utf8");
 }
 
 ok("default workflow yaml parses and validates", () => {
@@ -123,6 +126,17 @@ ok("defaults no_progress_limit and done_marker", () => {
 	assert.equal(result.workflow.done_marker, "[RALPH:DONE]");
 });
 
+ok("ignores unknown top-level keys and keeps optional description", () => {
+	const result = validateWorkflow({ initial: "a", description: " demo ", future: 1, states: { a: { prompt: "p.md", transition: "a" } } });
+	assert.ok(result.workflow, result.error);
+	assert.equal(result.workflow.description, "demo");
+});
+
+ok("rejects non-string description", () => {
+	const result = validateWorkflow({ initial: "a", description: 1, states: { a: { prompt: "p.md", transition: "a" } } });
+	assert.ok(result.error?.includes("description"));
+});
+
 // --- buildDirective ---
 
 const wf = validateWorkflow({
@@ -167,11 +181,73 @@ ok("custom directive with if/else and placeholders", () => {
 	assert.equal(noRange, "state=c range=none");
 });
 
+// --- presets ---
+
+ok("builtin dir ships the coding-review preset", () => {
+	assert.ok(existsSync(join(builtinWorkflowsDir(), "coding-review", "workflow.yaml")));
+	assert.ok(existsSync(join(builtinWorkflowsDir(), "coding-review", "prompts", "coding.md")));
+	assert.ok(existsSync(join(builtinWorkflowsDir(), "coding-review", "prompts", "review.md")));
+});
+
+ok("findPresets includes the builtin preset", () => {
+	const cwd = mkdtempSync(join(tmpdir(), "ralph-preset-"));
+	try {
+		const names = findPresets(cwd).map((p) => `${p.name}:${p.origin}`);
+		assert.ok(names.includes("coding-review:builtin"), names.join(","));
+	} finally {
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
+ok("project preset overrides builtin with the same name", () => {
+	const cwd = mkdtempSync(join(tmpdir(), "ralph-preset-"));
+	try {
+		const dir = join(cwd, ".ralph", "workflows", "coding-review");
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(join(dir, "workflow.yaml"), "initial: a\nstates:\n  a:\n    prompt: p.md\n    transition: a\n");
+		const resolved = resolvePreset(cwd, "coding-review");
+		assert.ok(!("error" in resolved), "should resolve");
+		assert.equal(resolved.origin, "project");
+		assert.equal(resolved.dir, dir);
+	} finally {
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
+ok("resolvePreset rejects path traversal and unknown names", () => {
+	const cwd = mkdtempSync(join(tmpdir(), "ralph-preset-"));
+	try {
+		assert.ok("error" in resolvePreset(cwd, "../../etc"));
+		assert.ok("error" in resolvePreset(cwd, "a/b"));
+		const missing = resolvePreset(cwd, "nope");
+		assert.ok("error" in missing && missing.error.includes("未找到"));
+	} finally {
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
+ok("preset directories without workflow.yaml are ignored", () => {
+	const cwd = mkdtempSync(join(tmpdir(), "ralph-preset-"));
+	try {
+		mkdirSync(join(cwd, ".ralph", "workflows", "empty"), { recursive: true });
+		assert.ok(!findPresets(cwd).some((p) => p.name === "empty"));
+	} finally {
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
 // --- initRalphFiles (via /ralph init equivalent, tested through file effects) ---
 
 ok("generated default workflow yaml validates", () => {
 	const result = validateWorkflow(parseYaml(defaultWorkflowYaml()));
 	assert.ok(result.workflow, result.error);
+});
+
+ok("builtin preset prompts exist and are non-empty", () => {
+	for (const name of ["coding", "review"]) {
+		const text = readFileSync(new URL(`../workflows/coding-review/prompts/${name}.md`, import.meta.url), "utf8");
+		assert.ok(text.trim().length > 0, name);
+	}
 });
 
 console.log(`\n${passed} tests passed`);
