@@ -5,7 +5,8 @@
 	"keywords": ["pi-package"],
 	"type": "module",
 	"pi": {
-		"extensions": ["./extensions/ralph-loop.ts"]
+		"extensions": ["./extensions/ralph-loop.ts"],
+		"skills": ["./skills"]
 	},
 	"dependencies": {
 		"yaml": "2.8.0"

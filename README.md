@@ -52,6 +52,27 @@ workflows/coding-review/
 
 自建预设：在 `~/.pi/agent/ralph/workflows/<name>/` 或 `<项目>/.ralph/workflows/<name>/` 下放 `workflow.yaml` 与提示词即可，无需在 `.ralph/` 里再写一份。预设名只允许字母/数字/`._-`（拒绝路径穿越）；启动前的校验（工作流、prompt 文件、模型）全部失败即返回，不产生任何副作用。
 
+### 让 agent 帮你写预设
+
+本包带一个 skill `ralph-workflow-author`，指导 agent 按步骤写出预设，并自带校验脚本：
+
+```bash
+node --experimental-strip-types skills/ralph-workflow-author/scripts/validate-preset.mts <name|dir> [--cwd <项目>]
+```
+
+安装本包后 pi 会自动发现它（也可直接 `/skill:ralph-workflow-author 帮我写一个 … 的预设`）。校验脚本调用扩展真实的 `validateWorkflow`，并额外检查：走不到的状态、流转不成环（尾巴+子环）、`records`/`consumes` 不配对、只读状态没配 `block`、提示词里没有 `done_marker`。退出码 0 即通过。
+
+只想把这个 skill 单独装进任意 agent（不装扩展）时，用 [`skills` CLI](https://skills.sh)：
+
+```bash
+npx skills add https://gitee.com/keeving/pi-ralph-loop.git      # 装到当前项目 (.agents/skills/)
+npx skills add https://gitee.com/keeving/pi-ralph-loop.git -g   # 装到用户级 (~/.agents/skills/)
+npx skills add https://gitee.com/keeving/pi-ralph-loop.git -l   # 只列出仓库里的 skill，不安装
+```
+
+URL **必须带 `.git` 后缀**：不带时 skills CLI 会当成 well-known 端点去探测，而 gitee 不提供该端点。
+安装的是 skill 目录的副本，不含本包的扩展代码与 `yaml` 依赖，所以校验脚本需要另外有一个 pi-ralph-loop 包在附近（脚本会从自身目录和当前目录向上查找），或用 `PI_RALPH_LOOP_DIR=<包目录>` 指定；找不到时脚本会明确报错而不是崩栈。
+
 ## 运行时文件（`.ralph/`，项目本地，不入库）
 
 - `workflow.yaml` - 仅 plain 模式（`/ralph start` 不带 preset）使用；预设模式下由 `driver.json` 的 `workflowDir` 指向预设目录
@@ -135,6 +156,7 @@ states:
 
 ```
 extensions/                     # /ralph 命令与状态机驱动
+skills/ralph-workflow-author/   # 教 agent 写预设的 skill（含校验脚本）
 workflows/coding-review/        # 内置预设
                     # 另：全局 ~/.pi/agent/ralph/workflows/、项目 .ralph/workflows/
 test/
@@ -147,4 +169,5 @@ npm install --ignore-scripts
 node --experimental-strip-types test/offline-test.mts   # 校验/指令生成/模型解析/预设解析
 node --experimental-strip-types test/regex-test.mts     # 默认拦截正则行为
 node --experimental-strip-types test/preset-test.mts    # 预设工作流集成测试（真实文件系统 + handler）
+node --experimental-strip-types test/validate-preset-test.mts  # skill 校验器正反例
 ```
